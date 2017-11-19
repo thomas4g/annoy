@@ -635,13 +635,17 @@ protected:
     return (Node*)((uint8_t *)_nodes + (_s * i));
   }
 
+  S _add_item() {
+    _allocate_size(_n_nodes + 1);
+    return _n_nodes++;
+  }
+
   S _make_tree(const vector<S >& indices) {
     if (indices.size() == 1)
       return indices[0];
 
     if (indices.size() <= (size_t)_K) {
-      _allocate_size(_n_nodes + 1);
-      S item = _n_nodes++;
+      S item = _add_item();
       Node* m = _get(item);
       m->n_descendants = (S)indices.size();
 
@@ -699,8 +703,7 @@ protected:
       // run _make_tree for the smallest child first (for cache locality)
       m->children[side^flip] = _make_tree(children_indices[side^flip]);
 
-    _allocate_size(_n_nodes + 1);
-    S item = _n_nodes++;
+    S item = _add_item();
     memcpy(_get(item), m, _s);
     free(m);
 
