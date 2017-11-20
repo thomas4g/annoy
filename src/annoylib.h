@@ -48,6 +48,7 @@ typedef signed __int32    int32_t;
 #include <algorithm>
 #include <queue>
 #include <limits>
+#include <pthread.h>
 
 // Needed for Visual Studio to disable runtime checks for mempcy
 #pragma runtime_checks("s", off)
@@ -433,13 +434,20 @@ protected:
   S _n_nodes;
   S _nodes_size;
   vector<S> _roots;
+  size_t _num_roots;
   S _K;
   bool _loaded;
   bool _verbose;
   int _fd;
+
+  // mutexes for building the tree in parallel
+  pthread_mutex_t _root_mutex;
+  pthread_mutex_t _nodes_mutex;
+
 public:
 
   AnnoyIndex(int f) : _f(f), _random() {
+    _num_roots = 0;
     _s = offsetof(Node, v) + f * sizeof(T); // Size of each node
     _verbose = false;
     _K = (_s - offsetof(Node, children)) / sizeof(S); // Max number of descendants to fit into node
@@ -479,28 +487,37 @@ public:
       showUpdate("You can't build a loaded index\n");
       return;
     }
+
+    // initialize mutexes
+    pthread_mutex_init(&_root_mutex, NULL);
+    pthread_mutex_init(&_nodes_mutex, NULL);
+
     _n_nodes = _n_items;
-    while (1) {
-      if (q == -1 && _n_nodes >= _n_items * 2)
-        break;
-      if (q != -1 && _roots.size() >= (size_t)q)
-        break;
-      if (_verbose) showUpdate("pass %zd...\n", _roots.size());
+  
+    int num_threads = 2;
 
-      vector<S> indices;
-      for (S i = 0; i < _n_items; i++) {
-	if (_get(i)->n_descendants >= 1) // Issue #223
-          indices.push_back(i);
-      }
-
-      _roots.push_back(_make_tree(indices));
+    pthread_t threads[num_threads];
+    BuildParams buildParams = {this, q};
+    for (int i = 0; i < num_threads; i++) {
+      pthread_create(&threads[i], NULL, _thread_build, &buildParams);
     }
+
+    for (int i = 0; i < num_threads; i++) {
+      pthread_join(threads[i], NULL);
+    }
+
+    pthread_mutex_destroy(&_root_mutex);
+    pthread_mutex_destroy(&_nodes_mutex);
+
     // Also, copy the roots into the last segment of the array
     // This way we can load them faster without reading the whole file
+    showUpdate("copying roots into last segment of array...\n");
     _allocate_size(_n_nodes + (S)_roots.size());
     for (size_t i = 0; i < _roots.size(); i++)
       memcpy(_get(_n_nodes + (S)i), _get(_roots[i]), _s);
     _n_nodes += _roots.size();
+
+    showUpdate("Requested Roots Size: %d, Actual Size: %d\n", q, _roots.size());
 
     if (_verbose) showUpdate("has %d nodes\n", _n_nodes);
   }
@@ -619,6 +636,40 @@ public:
   }
 
 protected:
+  struct BuildParams {
+    AnnoyIndex* a;
+    int q;
+  };
+
+  static void* _thread_build(void* p) {
+    BuildParams* buildParams = (BuildParams*) p;
+    buildParams->a->_build(buildParams->q);
+  }
+  
+  void _build(int q) { 
+    while (1) {
+      if (q == -1 && _n_nodes >= _n_items * 2)
+        break;
+
+      int roots_size = __atomic_fetch_add(&_num_roots, 1, __ATOMIC_SEQ_CST);
+      if (q != -1 && roots_size >= (size_t)q)
+        break;
+      if (_verbose) showUpdate("pass %zd...\n", roots_size);
+
+      vector<S> indices;
+      for (S i = 0; i < _n_items; i++) {
+        if (_get(i)->n_descendants >= 1) // Issue #223
+          indices.push_back(i);
+      }
+
+      S tree = _make_tree(indices);
+    
+      pthread_mutex_lock(&_root_mutex);
+      _roots.push_back(tree);
+      pthread_mutex_unlock(&_root_mutex);
+    }
+  }
+
   void _allocate_size(S n) {
     if (n > _nodes_size) {
       const double reallocation_factor = 1.3;
@@ -626,18 +677,24 @@ protected:
 				  (S)((_nodes_size + 1) * reallocation_factor));
       if (_verbose) showUpdate("Reallocating to %d nodes\n", new_nodes_size);
       _nodes = realloc(_nodes, _s * new_nodes_size);
+      if (_verbose) showUpdate("Realloc success\n");
       memset((char *)_nodes + (_nodes_size * _s)/sizeof(char), 0, (new_nodes_size - _nodes_size) * _s);
+      if (_verbose) showUpdate("memset success\n");
       _nodes_size = new_nodes_size;
     }
   }
 
   inline Node* _get(S i) {
-    return (Node*)((uint8_t *)_nodes + (_s * i));
+    Node* n = (Node*)((uint8_t *)_nodes + (_s * i));
+    return n;
   }
 
   S _add_item() {
+    pthread_mutex_lock(&_nodes_mutex);
     _allocate_size(_n_nodes + 1);
-    return _n_nodes++;
+    S item = _n_nodes++;
+    pthread_mutex_unlock(&_nodes_mutex);
+		return item;
   }
 
   S _make_tree(const vector<S >& indices) {
